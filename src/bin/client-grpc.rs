@@ -1,8 +1,7 @@
 use {
     clap::Parser,
     futures::{sink::SinkExt, stream::StreamExt},
-    geyser_grpc_bench::format_thousands,
-    indicatif::{ProgressBar, ProgressStyle},
+    geyser_grpc_bench::BenchProgressBar,
     maplit::hashmap,
     prost::Message,
     std::{collections::HashMap, env},
@@ -19,11 +18,20 @@ use {
 #[derive(Debug, Clone, Parser)]
 #[clap(author, version, about)]
 struct Args {
-    #[clap(short, long, default_value_t = String::from("http://127.0.0.1:10000"))]
+    #[clap(short, long, default_value_t = String::from("http://127.0.0.1:10001"))]
     endpoint: String,
 
     #[clap(long)]
     x_token: Option<String>,
+
+    #[clap(long, default_value_t = false)]
+    http2_adaptive_window: bool,
+
+    #[clap(long, default_value_t = 65535)]
+    initial_connection_window_size: u32,
+
+    #[clap(long, default_value_t = 65535)]
+    initial_stream_window_size: u32,
 }
 
 #[tokio::main]
@@ -37,6 +45,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let mut client = GeyserGrpcClient::build_from_shared(args.endpoint)?
+        .http2_adaptive_window(args.http2_adaptive_window)
+        .initial_connection_window_size(args.initial_connection_window_size)
+        .initial_stream_window_size(args.initial_stream_window_size)
         .x_token(args.x_token)?
         .tls_config(ClientTlsConfig::new().with_native_roots())?
         .max_decoding_message_size(128 * 1024 * 1024) // 128MiB for block meta with rewards
@@ -62,21 +73,12 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
-    let pb = ProgressBar::no_length();
-    pb.set_style(ProgressStyle::with_template(
-        "{spinner} received messages: {msg} / ~{bytes}",
-    )?);
-
-    let mut counter = 0;
-    let mut slot = 0;
+    let mut pb = BenchProgressBar::default();
     while let Some(Ok(message)) = stream.next().await {
         if let Some(UpdateOneof::BlockMeta(meta)) = &message.update_oneof {
-            slot = meta.slot;
+            pb.set_slot(meta.slot);
         }
-
-        counter += 1;
-        pb.set_message(format!("{} / slot {}", format_thousands(counter), slot));
-        pb.inc(message.encoded_len() as u64);
+        pb.inc(message.encoded_len());
     }
     anyhow::bail!("stream failed");
 }
