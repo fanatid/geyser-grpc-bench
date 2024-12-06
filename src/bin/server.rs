@@ -12,13 +12,7 @@ use {
     prost::Message,
     quinn::{crypto::rustls::QuicServerConfig, Endpoint},
     rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-    std::{
-        collections::{BTreeSet, HashMap, VecDeque},
-        env, io,
-        path::PathBuf,
-        sync::Arc,
-        time::Duration,
-    },
+    std::{collections::HashMap, env, path::PathBuf, sync::Arc, time::Duration},
     tokio::{
         fs,
         io::AsyncWriteExt,
@@ -88,15 +82,15 @@ struct Args {
     #[clap(long, default_value_t = 12_500 * 1_000)]
     quic_max_stream_bandwidth: u32,
 
-    #[clap(long, default_value_t = 16)]
-    quic_max_streams: u32,
+    #[clap(long, default_value_t = 128)]
+    quic_config_max_connections: u32,
 
     #[clap(long, default_value_t = false)]
     slow_connection: bool,
 }
 
 struct GrpcService {
-    tx: broadcast::Sender<TonicResult<SubscribeUpdate>>,
+    tx: broadcast::Sender<TonicResult<(u64, Arc<SubscribeUpdate>)>>,
 }
 
 #[tonic::async_trait]
@@ -112,7 +106,7 @@ impl Geyser for GrpcService {
         let mut stream = self.tx.subscribe();
         tokio::spawn(async move {
             while let Ok(msg) = stream.recv().await {
-                tx.send(msg).await?;
+                tx.send(msg.map(|(_, x)| x.as_ref().clone())).await?;
             }
             Ok::<_, anyhow::Error>(())
         });
@@ -162,87 +156,54 @@ impl Geyser for GrpcService {
 
 async fn handle_quic(
     incoming: quinn::Incoming,
-    tx: broadcast::Sender<TonicResult<SubscribeUpdate>>,
-    max_streams: u32,
+    tx: broadcast::Sender<TonicResult<(u64, Arc<SubscribeUpdate>)>>,
 ) -> anyhow::Result<()> {
     let conn = incoming.await?;
 
-    let mut stream = conn.accept_uni().await?;
-    let quic_request_body = stream.read_to_end(1024).await?;
-    let QuicStreamRequest {
-        streams: streams_total,
-        max_backlog,
-    } = serde_json::from_slice(&quic_request_body).context("failed to parse quic request")?;
-    anyhow::ensure!(streams_total <= max_streams, "exceed max number of streams");
-    let max_backlog = max_backlog as u64;
-
-    let mut streams = VecDeque::with_capacity(streams_total as usize);
-    while streams.len() < streams_total as usize {
-        streams.push_back(conn.open_uni().await?);
-    }
-
-    let mut rx = tx.subscribe();
-    let mut msg_id = 0;
-    let mut msg_ids = BTreeSet::new();
-    let mut next_message: Option<SubscribeUpdate> = None;
     let mut set = JoinSet::new();
     loop {
-        if msg_id - msg_ids.first().copied().unwrap_or(msg_id) < max_backlog {
-            if let Some(message) = next_message.take() {
-                if let Some(mut stream) = streams.pop_front() {
-                    msg_ids.insert(msg_id);
-                    set.spawn(async move {
-                        let message = message.encode_to_vec();
-                        stream.write_u64(msg_id).await?;
-                        stream.write_u64(message.len() as u64).await?;
-                        stream.write_all(&message).await?;
-                        Ok::<_, io::Error>((msg_id, stream))
-                    });
-                    msg_id = msg_id.wrapping_add(1);
-                } else {
-                    next_message = Some(message);
-                }
-            }
-        }
-
-        let rx_recv = if next_message.is_none() {
-            rx.recv().boxed()
-        } else {
+        let set_fut = if set.is_empty() {
             pending().boxed()
-        };
-        let set_join_next = if !set.is_empty() {
+        } else {
             set.join_next().boxed()
-        } else {
-            pending().boxed()
         };
-
-        tokio::select! {
-            message = rx_recv => {
-                match message {
-                    Ok(Ok(message)) => next_message = Some(message),
-                    Ok(Err(error)) => anyhow::bail!("subscribe update error: {error:?}"),
-                    Err(_error) => anyhow::bail!("broadcast channel is closed"),
-                }
-            },
-            result = set_join_next => match result {
-                Some(Ok(Ok((msg_id, stream)))) => {
-                    msg_ids.remove(&msg_id);
-                    streams.push_back(stream);
-                },
-                Some(Ok(Err(error))) => anyhow::bail!("failed to send data: {error:?}"),
-                Some(Err(error)) => anyhow::bail!("failed to join sending task: {error:?}"),
+        let (mut send, mut recv) = tokio::select! {
+            value = conn.accept_bi() => value?,
+            result = set_fut => match result {
+                Some(result) => anyhow::bail!("bidi stream result: {result:?}"),
                 None => unreachable!(),
             }
-        }
+        };
+
+        let quic_request_body = recv.read_to_end(1024).await?;
+        let QuicStreamRequest {
+            connections_current,
+            connections_total,
+        } = serde_json::from_slice(&quic_request_body).context("failed to parse quic request")?;
+
+        let mut rx = tx.subscribe();
+        set.spawn(async move {
+            loop {
+                let (msg_id, message) = match rx.recv().await {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => anyhow::bail!("subscribe update error: {error:?}"),
+                    Err(_error) => anyhow::bail!("broadcast channel is closed"),
+                };
+
+                if msg_id % connections_total == connections_current {
+                    let message = message.encode_to_vec();
+                    send.write_u64(msg_id).await?;
+                    send.write_u64(message.len() as u64).await?;
+                    send.write_all(&message).await?;
+                }
+            }
+
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        });
     }
 
     #[allow(unreachable_code)]
-    for (_, stream) in set.join_all().await.into_iter().flatten() {
-        stream.finish()?;
-    }
-    for stream in streams {
-        stream.finish()?;
-    }
     drop(conn);
 
     Ok(())
@@ -258,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let (tx, _rx) = broadcast::channel::<TonicResult<SubscribeUpdate>>(524_288); // 2**19
+    let (tx, _rx) = broadcast::channel::<TonicResult<(u64, Arc<SubscribeUpdate>)>>(524_288); // 2**19
 
     let stream_tx = tx.clone();
     let stream_jh = tokio::spawn(async move {
@@ -297,14 +258,17 @@ async fn main() -> anyhow::Result<()> {
         subscribe_tx.send(request).await?;
 
         let mut pb = BenchProgressBar::default();
+        let mut msg_id = 0;
         while let Some(Ok(message)) = stream.next().await {
             if let Some(UpdateOneof::BlockMeta(meta)) = &message.update_oneof {
                 pb.set_slot(meta.slot);
             }
             pb.inc(message.encoded_len());
 
+            let message = Arc::new(message);
             for _ in 0..args.multiplier {
-                let _ = stream_tx.send(Ok(message.clone()));
+                let _ = stream_tx.send(Ok((msg_id, Arc::clone(&message))));
+                msg_id = msg_id.wrapping_add(1);
             }
         }
 
@@ -383,8 +347,8 @@ async fn main() -> anyhow::Result<()> {
                 QuicServerConfig::try_from(server_crypto)?,
             ));
             let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-            transport_config.max_concurrent_bidi_streams(0u8.into());
-            transport_config.max_concurrent_uni_streams(1u8.into());
+            transport_config.max_concurrent_bidi_streams(args.quic_config_max_connections.into());
+            transport_config.max_concurrent_uni_streams(0u8.into());
             let stream_rwnd = args.quic_max_stream_bandwidth / 1_000 * args.quic_expected_rtt;
             transport_config.stream_receive_window(stream_rwnd.into());
             transport_config.send_window(8 * stream_rwnd as u64);
@@ -396,9 +360,7 @@ async fn main() -> anyhow::Result<()> {
             while let Some(incoming) = endpoint.accept().await {
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    if let Err(error) =
-                        handle_quic(incoming, tx.clone(), args.quic_max_streams).await
-                    {
+                    if let Err(error) = handle_quic(incoming, tx.clone()).await {
                         error!("quic connection failed: {error:?}");
                     }
                 });

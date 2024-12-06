@@ -5,8 +5,8 @@ use {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct QuicStreamRequest {
-    pub streams: u32,
-    pub max_backlog: u32,
+    pub connections_current: u64,
+    pub connections_total: u64,
 }
 
 fn format_thousands(value: u64) -> String {

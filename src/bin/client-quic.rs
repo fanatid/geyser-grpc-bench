@@ -8,7 +8,11 @@ use {
     quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Endpoint, TransportConfig},
     rustls::pki_types::{CertificateDer, ServerName, UnixTime},
     std::{collections::HashMap, env, path::PathBuf, sync::Arc},
-    tokio::{fs, io::AsyncReadExt, sync::mpsc},
+    tokio::{
+        fs,
+        io::AsyncReadExt,
+        sync::{mpsc, oneshot},
+    },
     yellowstone_grpc_proto::prelude::{subscribe_update::UpdateOneof, SubscribeUpdate},
 };
 
@@ -34,10 +38,7 @@ struct Args {
 
     /// Number of quic streams
     #[clap(long, default_value_t = 1)]
-    config_streams: u32,
-
-    #[clap(long, default_value_t = 65_536)]
-    config_max_backlog: u32,
+    config_connections: u64,
 }
 
 /// Dummy certificate verifier that treats any certificate as valid.
@@ -126,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut transport_config = TransportConfig::default();
     transport_config.max_concurrent_bidi_streams(0u8.into());
-    transport_config.max_concurrent_uni_streams(args.config_streams.into());
+    transport_config.max_concurrent_uni_streams(0u8.into());
     let stream_rwnd = args.max_stream_bandwidth / 1_000 * args.expected_rtt;
     transport_config.stream_receive_window(stream_rwnd.into());
     transport_config.send_window(8 * stream_rwnd as u64);
@@ -144,28 +145,35 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     info!("connected to addr {}", conn.remote_address());
 
-    let mut send = conn.open_uni().await?;
-    send.write_all(
-        &serde_json::to_vec(&QuicStreamRequest {
-            streams: args.config_streams,
-            max_backlog: args.config_max_backlog,
-        })
-        .context("failed to create quic request")?,
-    )
-    .await?;
-    send.finish()?;
-
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut readers = Vec::with_capacity(args.config_streams as usize);
-    for _ in 0..args.config_streams {
-        let mut stream = conn.accept_uni().await?;
+    let mut readers = Vec::with_capacity(args.config_connections as usize);
+    let mut msg_ids = Vec::with_capacity(args.config_connections as usize);
+    for connections_current in 0..args.config_connections {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(
+            &serde_json::to_vec(&QuicStreamRequest {
+                connections_current,
+                connections_total: args.config_connections,
+            })
+            .context("failed to create quic request")?,
+        )
+        .await?;
+        send.finish()?;
+
         let tx = tx.clone();
+        let (msg_id_tx, msg_id_rx) = oneshot::channel();
+        msg_ids.push(msg_id_rx);
+        let mut msg_id_tx = Some(msg_id_tx);
         readers.push(tokio::spawn(async move {
             let mut buf = vec![0; 128 * 1024 * 1024];
             loop {
-                let msg_id = stream.read_u64().await?;
-                let size = stream.read_u64().await? as usize;
-                stream.read_exact(&mut buf.as_mut_slice()[0..size]).await?;
+                let msg_id = recv.read_u64().await?;
+                if let Some(tx) = msg_id_tx.take() {
+                    tx.send(msg_id)
+                        .map_err(|_| anyhow::anyhow!("failed to send oneshot"))?;
+                }
+                let size = recv.read_u64().await? as usize;
+                recv.read_exact(&mut buf.as_mut_slice()[0..size]).await?;
                 let message = SubscribeUpdate::decode(&buf.as_slice()[0..size])?;
                 tx.send((msg_id, message))?;
             }
@@ -177,7 +185,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::pin!(read_fut);
 
     let mut pb = BenchProgressBar::default();
-    let mut msg_id = 0u64;
+    let msg_ids = try_join_all(msg_ids).await?;
+    let mut msg_id = msg_ids.into_iter().min().expect("at least one stream");
     let mut messages = HashMap::new();
     loop {
         tokio::select! {
