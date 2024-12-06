@@ -1,4 +1,13 @@
-use indicatif::{ProgressBar, ProgressStyle};
+use {
+    indicatif::{ProgressBar, ProgressStyle},
+    serde::{Deserialize, Serialize},
+};
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct QuicStreamRequest {
+    pub streams: u32,
+    pub max_backlog: u32,
+}
 
 fn format_thousands(value: u64) -> String {
     value

@@ -2,22 +2,29 @@ use {
     anyhow::Context,
     clap::Parser,
     futures::{
-        future::{ready, FutureExt},
+        future::{pending, ready, FutureExt},
         sink::SinkExt,
         stream::StreamExt,
     },
-    geyser_grpc_bench::BenchProgressBar,
+    geyser_grpc_bench::{BenchProgressBar, QuicStreamRequest},
     log::{error, info},
     maplit::hashmap,
     prost::Message,
     quinn::{crypto::rustls::QuicServerConfig, Endpoint},
     rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-    std::{collections::HashMap, env, path::PathBuf, sync::Arc, time::Duration},
+    std::{
+        collections::{BTreeSet, HashMap, VecDeque},
+        env, io,
+        path::PathBuf,
+        sync::Arc,
+        time::Duration,
+    },
     tokio::{
         fs,
         io::AsyncWriteExt,
         signal::unix::{signal, SignalKind},
         sync::{broadcast, mpsc},
+        task::JoinSet,
     },
     tokio_stream::wrappers::ReceiverStream,
     tonic::{
@@ -80,6 +87,9 @@ struct Args {
     /// Value in bytes/s, default with expected rtt 100 is 100Mbps
     #[clap(long, default_value_t = 12_500 * 1_000)]
     quic_max_stream_bandwidth: u32,
+
+    #[clap(long, default_value_t = 16)]
+    quic_max_streams: u32,
 
     #[clap(long, default_value_t = false)]
     slow_connection: bool,
@@ -153,23 +163,86 @@ impl Geyser for GrpcService {
 async fn handle_quic(
     incoming: quinn::Incoming,
     tx: broadcast::Sender<TonicResult<SubscribeUpdate>>,
+    max_streams: u32,
 ) -> anyhow::Result<()> {
     let conn = incoming.await?;
 
-    // let mut stream = conn.accept_uni().await?;
-    // let req = stream.read_to_end(1024).await?;
-    // info!("received: {:?}", std::str::from_utf8(&req));
+    let mut stream = conn.accept_uni().await?;
+    let quic_request_body = stream.read_to_end(1024).await?;
+    let QuicStreamRequest {
+        streams: streams_total,
+        max_backlog,
+    } = serde_json::from_slice(&quic_request_body).context("failed to parse quic request")?;
+    anyhow::ensure!(streams_total <= max_streams, "exceed max number of streams");
+    let max_backlog = max_backlog as u64;
 
-    let mut stream = conn.open_uni().await?;
-
-    let mut rx = tx.subscribe();
-    while let Ok(Ok(update)) = rx.recv().await {
-        let message = update.encode_to_vec();
-        stream.write_u64(message.len() as u64).await?;
-        stream.write_all(&message).await?;
+    let mut streams = VecDeque::with_capacity(streams_total as usize);
+    while streams.len() < streams_total as usize {
+        streams.push_back(conn.open_uni().await?);
     }
 
-    stream.finish()?;
+    let mut rx = tx.subscribe();
+    let mut msg_id = 0;
+    let mut msg_ids = BTreeSet::new();
+    let mut next_message: Option<SubscribeUpdate> = None;
+    let mut set = JoinSet::new();
+    loop {
+        if msg_id - msg_ids.first().copied().unwrap_or(msg_id) < max_backlog {
+            if let Some(message) = next_message.take() {
+                if let Some(mut stream) = streams.pop_front() {
+                    msg_ids.insert(msg_id);
+                    set.spawn(async move {
+                        let message = message.encode_to_vec();
+                        stream.write_u64(msg_id).await?;
+                        stream.write_u64(message.len() as u64).await?;
+                        stream.write_all(&message).await?;
+                        Ok::<_, io::Error>((msg_id, stream))
+                    });
+                    msg_id = msg_id.wrapping_add(1);
+                } else {
+                    next_message = Some(message);
+                }
+            }
+        }
+
+        let rx_recv = if next_message.is_none() {
+            rx.recv().boxed()
+        } else {
+            pending().boxed()
+        };
+        let set_join_next = if !set.is_empty() {
+            set.join_next().boxed()
+        } else {
+            pending().boxed()
+        };
+
+        tokio::select! {
+            message = rx_recv => {
+                match message {
+                    Ok(Ok(message)) => next_message = Some(message),
+                    Ok(Err(error)) => anyhow::bail!("subscribe update error: {error:?}"),
+                    Err(_error) => anyhow::bail!("broadcast channel is closed"),
+                }
+            },
+            result = set_join_next => match result {
+                Some(Ok(Ok((msg_id, stream)))) => {
+                    msg_ids.remove(&msg_id);
+                    streams.push_back(stream);
+                },
+                Some(Ok(Err(error))) => anyhow::bail!("failed to send data: {error:?}"),
+                Some(Err(error)) => anyhow::bail!("failed to join sending task: {error:?}"),
+                None => unreachable!(),
+            }
+        }
+    }
+
+    #[allow(unreachable_code)]
+    for (_, stream) in set.join_all().await.into_iter().flatten() {
+        stream.finish()?;
+    }
+    for stream in streams {
+        stream.finish()?;
+    }
     drop(conn);
 
     Ok(())
@@ -310,7 +383,8 @@ async fn main() -> anyhow::Result<()> {
                 QuicServerConfig::try_from(server_crypto)?,
             ));
             let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-            transport_config.max_concurrent_bidi_streams(0_u8.into());
+            transport_config.max_concurrent_bidi_streams(0u8.into());
+            transport_config.max_concurrent_uni_streams(1u8.into());
             let stream_rwnd = args.quic_max_stream_bandwidth / 1_000 * args.quic_expected_rtt;
             transport_config.stream_receive_window(stream_rwnd.into());
             transport_config.send_window(8 * stream_rwnd as u64);
@@ -322,7 +396,9 @@ async fn main() -> anyhow::Result<()> {
             while let Some(incoming) = endpoint.accept().await {
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_quic(incoming, tx.clone()).await {
+                    if let Err(error) =
+                        handle_quic(incoming, tx.clone(), args.quic_max_streams).await
+                    {
                         error!("quic connection failed: {error:?}");
                     }
                 });

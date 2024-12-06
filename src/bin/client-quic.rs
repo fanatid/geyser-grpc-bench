@@ -1,13 +1,14 @@
 use {
     anyhow::Context,
     clap::Parser,
-    geyser_grpc_bench::BenchProgressBar,
+    futures::future::try_join_all,
+    geyser_grpc_bench::{BenchProgressBar, QuicStreamRequest},
     log::info,
     prost::Message,
     quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Endpoint, TransportConfig},
     rustls::pki_types::{CertificateDer, ServerName, UnixTime},
-    std::{env, path::PathBuf, sync::Arc},
-    tokio::{fs, io::AsyncReadExt},
+    std::{collections::HashMap, env, path::PathBuf, sync::Arc},
+    tokio::{fs, io::AsyncReadExt, sync::mpsc},
     yellowstone_grpc_proto::prelude::{subscribe_update::UpdateOneof, SubscribeUpdate},
 };
 
@@ -30,6 +31,13 @@ struct Args {
     /// Value in bytes/s, default with expected rtt 100 is 100Mbps
     #[clap(long, default_value_t = 12_500 * 1_000)]
     max_stream_bandwidth: u32,
+
+    /// Number of quic streams
+    #[clap(long, default_value_t = 1)]
+    config_streams: u32,
+
+    #[clap(long, default_value_t = 65_536)]
+    config_max_backlog: u32,
 }
 
 /// Dummy certificate verifier that treats any certificate as valid.
@@ -117,6 +125,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut transport_config = TransportConfig::default();
+    transport_config.max_concurrent_bidi_streams(0u8.into());
+    transport_config.max_concurrent_uni_streams(args.config_streams.into());
     let stream_rwnd = args.max_stream_bandwidth / 1_000 * args.expected_rtt;
     transport_config.stream_receive_window(stream_rwnd.into());
     transport_config.send_window(8 * stream_rwnd as u64);
@@ -134,23 +144,58 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     info!("connected to addr {}", conn.remote_address());
 
-    // let mut send = conn.open_uni().await?;
-    // send.write_all(b"hello").await?;
-    // send.finish()?;
-    // drop(conn);
+    let mut send = conn.open_uni().await?;
+    send.write_all(
+        &serde_json::to_vec(&QuicStreamRequest {
+            streams: args.config_streams,
+            max_backlog: args.config_max_backlog,
+        })
+        .context("failed to create quic request")?,
+    )
+    .await?;
+    send.finish()?;
 
-    let mut stream = conn.accept_uni().await?;
-    let mut buf = vec![0; 128 * 1024 * 1024];
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut readers = Vec::with_capacity(args.config_streams as usize);
+    for _ in 0..args.config_streams {
+        let mut stream = conn.accept_uni().await?;
+        let tx = tx.clone();
+        readers.push(tokio::spawn(async move {
+            let mut buf = vec![0; 128 * 1024 * 1024];
+            loop {
+                let msg_id = stream.read_u64().await?;
+                let size = stream.read_u64().await? as usize;
+                stream.read_exact(&mut buf.as_mut_slice()[0..size]).await?;
+                let message = SubscribeUpdate::decode(&buf.as_slice()[0..size])?;
+                tx.send((msg_id, message))?;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+    let read_fut = try_join_all(readers);
+    tokio::pin!(read_fut);
+
     let mut pb = BenchProgressBar::default();
+    let mut msg_id = 0u64;
+    let mut messages = HashMap::new();
     loop {
-        let size = stream.read_u64().await? as usize;
-        stream.read_exact(&mut buf.as_mut_slice()[0..size]).await?;
+        tokio::select! {
+            result = &mut read_fut => anyhow::bail!("readers failed/finished: {result:?}"),
+            message = rx.recv() => match message {
+                Some((id, message)) => messages.insert(id, message),
+                None => anyhow::bail!("failed to get message from the channel"),
+            },
+        };
 
-        let message = SubscribeUpdate::decode(&buf.as_slice()[0..size])?;
-        if let Some(UpdateOneof::BlockMeta(meta)) = &message.update_oneof {
-            pb.set_slot(meta.slot);
+        while let Some(message) = messages.remove(&msg_id) {
+            msg_id = msg_id.wrapping_add(1);
+
+            if let Some(UpdateOneof::BlockMeta(meta)) = &message.update_oneof {
+                pb.set_slot(meta.slot);
+            }
+            pb.inc(message.encoded_len());
         }
-        pb.inc(message.encoded_len());
     }
 
     #[allow(unreachable_code)]

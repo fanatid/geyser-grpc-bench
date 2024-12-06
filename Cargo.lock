@@ -1414,6 +1414,8 @@ dependencies = [
  "rcgen",
  "rustls 0.23.19",
  "rustls-pemfile 2.2.0",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",
