@@ -96,7 +96,7 @@ struct Args {
 }
 
 struct GrpcService {
-    tx: broadcast::Sender<TonicResult<SubscribeUpdate>>,
+    tx: broadcast::Sender<TonicResult<Arc<SubscribeUpdate>>>,
 }
 
 #[tonic::async_trait]
@@ -112,7 +112,7 @@ impl Geyser for GrpcService {
         let mut stream = self.tx.subscribe();
         tokio::spawn(async move {
             while let Ok(msg) = stream.recv().await {
-                tx.send(msg).await?;
+                tx.send(msg.map(|x| x.as_ref().clone())).await?;
             }
             Ok::<_, anyhow::Error>(())
         });
@@ -162,7 +162,7 @@ impl Geyser for GrpcService {
 
 async fn handle_quic(
     incoming: quinn::Incoming,
-    tx: broadcast::Sender<TonicResult<SubscribeUpdate>>,
+    tx: broadcast::Sender<TonicResult<Arc<SubscribeUpdate>>>,
     max_streams: u32,
 ) -> anyhow::Result<()> {
     let conn = incoming.await?;
@@ -184,7 +184,7 @@ async fn handle_quic(
     let mut rx = tx.subscribe();
     let mut msg_id = 0;
     let mut msg_ids = BTreeSet::new();
-    let mut next_message: Option<SubscribeUpdate> = None;
+    let mut next_message: Option<Arc<SubscribeUpdate>> = None;
     let mut set = JoinSet::new();
     loop {
         if msg_id - msg_ids.first().copied().unwrap_or(msg_id) < max_backlog {
@@ -258,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let (tx, _rx) = broadcast::channel::<TonicResult<SubscribeUpdate>>(524_288); // 2**19
+    let (tx, _rx) = broadcast::channel::<TonicResult<Arc<SubscribeUpdate>>>(524_288); // 2**19
 
     let stream_tx = tx.clone();
     let stream_jh = tokio::spawn(async move {
@@ -303,8 +303,9 @@ async fn main() -> anyhow::Result<()> {
             }
             pb.inc(message.encoded_len());
 
+            let message = Arc::new(message);
             for _ in 0..args.multiplier {
-                let _ = stream_tx.send(Ok(message.clone()));
+                let _ = stream_tx.send(Ok(Arc::clone(&message)));
             }
         }
 
