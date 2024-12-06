@@ -1413,12 +1413,14 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls 0.23.19",
+ "rustls-native-certs 0.8.1",
  "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",
+ "webpki-roots 0.26.7",
  "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
 ]
@@ -2839,7 +2841,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 0.25.4",
  "winreg",
 ]
 
@@ -5073,6 +5075,15 @@ name = "webpki-roots"
 version = "0.25.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d642ff16b7e79272ae451b7322067cdc17cadf68c23264be9d94a32319efe7e"
+dependencies = [
+ "rustls-pki-types",
+]
 
 [[package]]
 name = "winapi"

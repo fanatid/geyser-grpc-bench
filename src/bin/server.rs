@@ -31,6 +31,7 @@ use {
         transport::{
             channel::ClientTlsConfig,
             server::{Server, TcpIncoming},
+            Identity, ServerTlsConfig,
         },
         Request, Response, Result as TonicResult, Status, Streaming,
     },
@@ -61,6 +62,12 @@ struct Args {
 
     #[clap(long)]
     grpc_listen: Option<String>,
+
+    #[clap(long)]
+    grpc_key: Option<PathBuf>,
+
+    #[clap(long)]
+    grpc_cert: Option<PathBuf>,
 
     #[clap(long, default_value_t = false)]
     grpc_http2_adaptive_window: bool,
@@ -326,7 +333,15 @@ async fn main() -> anyhow::Result<()> {
 
             let service = GeyserServer::new(GrpcService { tx: grpc_tx });
 
-            Server::builder()
+            let mut builder = Server::builder();
+            if let (Some(key_path), Some(cert_path)) = (args.grpc_key, args.grpc_cert) {
+                let (cert, key) = tokio::try_join!(fs::read(&cert_path), fs::read(&key_path))
+                    .context("failed to load tls files")?;
+                builder = builder
+                    .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
+                    .context("failed to apply tls_config")?
+            }
+            builder
                 .http2_adaptive_window(Some(args.grpc_http2_adaptive_window))
                 .initial_connection_window_size(args.grpc_initial_connection_window_size)
                 .initial_stream_window_size(args.grpc_initial_stream_window_size)

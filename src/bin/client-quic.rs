@@ -6,9 +6,12 @@ use {
     log::info,
     prost::Message,
     quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Endpoint, TransportConfig},
-    rustls::pki_types::{CertificateDer, ServerName, UnixTime},
+    rustls::{
+        pki_types::{CertificateDer, ServerName, UnixTime},
+        RootCertStore,
+    },
     std::{collections::HashMap, env, path::PathBuf, sync::Arc},
-    tokio::{fs, io::AsyncReadExt, sync::mpsc},
+    tokio::{fs, io::AsyncReadExt, net::lookup_host, sync::mpsc},
     yellowstone_grpc_proto::prelude::{subscribe_update::UpdateOneof, SubscribeUpdate},
 };
 
@@ -17,6 +20,10 @@ use {
 struct Args {
     #[clap(short, long, default_value_t = String::from("127.0.0.1:10002"))]
     endpoint: String,
+
+    /// Override hostname used for certificate verification
+    #[clap(long)]
+    host: String,
 
     #[clap(long)]
     cert: Option<PathBuf>,
@@ -111,17 +118,34 @@ async fn main() -> anyhow::Result<()> {
             .dangerous()
             .with_custom_certificate_verifier(SkipServerVerification::new())
             .with_no_client_auth()
-    } else if let Some(cert_path) = args.cert {
-        let mut roots = rustls::RootCertStore::empty();
-        let cert = fs::read(cert_path)
-            .await
-            .context("failed to read certificate chain")?;
-        roots.add(CertificateDer::from(cert))?;
+    } else {
+        let mut roots = RootCertStore::empty();
+        // native
+        let rustls_native_certs::CertificateResult { certs, errors, .. } =
+            rustls_native_certs::load_native_certs();
+        if !errors.is_empty() {
+            log::error!("errors occured when loading native certs: {errors:?}");
+        }
+        roots.add_parsable_certificates(certs);
+        // webpki
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // custom
+        if let Some(cert_path) = args.cert {
+            let cert_chain = fs::read(&cert_path)
+                .await
+                .context("failed to read certificate chain")?;
+            if cert_path.extension().is_some_and(|x| x == "der") {
+                roots.add(CertificateDer::from(cert_chain))?;
+            } else {
+                for cert in rustls_pemfile::certs(&mut &*cert_chain) {
+                    roots.add(cert.context("invalid PEM-encoded certificate")?)?;
+                }
+            }
+        }
+        // build
         rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth()
-    } else {
-        anyhow::bail!("secure mode require cert")
     };
 
     let mut transport_config = TransportConfig::default();
@@ -139,9 +163,12 @@ async fn main() -> anyhow::Result<()> {
     let mut endpoint = Endpoint::client("[::]:0".parse()?)?;
     endpoint.set_default_client_config(client_config);
 
-    let conn = endpoint
-        .connect(args.endpoint.parse()?, "localhost")?
-        .await?;
+    let addr = lookup_host(&args.endpoint)
+        .await
+        .context("failed to lookup")?
+        .find(|addr| addr.is_ipv4())
+        .ok_or(anyhow::anyhow!("failed to lookup ipv4 addr"))?;
+    let conn = endpoint.connect(addr, &args.host)?.await?;
     info!("connected to addr {}", conn.remote_address());
 
     let mut send = conn.open_uni().await?;
