@@ -15,6 +15,7 @@ use {
     std::{
         collections::{BTreeSet, HashMap, VecDeque},
         env, io,
+        net::SocketAddr,
         path::PathBuf,
         sync::Arc,
         time::Duration,
@@ -22,6 +23,7 @@ use {
     tokio::{
         fs,
         io::AsyncWriteExt,
+        net::TcpListener,
         signal::unix::{signal, SignalKind},
         sync::{broadcast, mpsc},
         task::JoinSet,
@@ -59,6 +61,9 @@ struct Args {
 
     #[clap(long)]
     multiplier: usize,
+
+    #[clap(long, default_value_t = false)]
+    slow_connection: bool,
 
     #[clap(long)]
     grpc_listen: Option<String>,
@@ -98,8 +103,11 @@ struct Args {
     #[clap(long, default_value_t = 16)]
     quic_max_streams: u32,
 
-    #[clap(long, default_value_t = false)]
-    slow_connection: bool,
+    #[clap(long)]
+    tcp_listen: Option<String>,
+
+    #[clap(long)]
+    tcp_nodelay: Option<bool>,
 }
 
 struct GrpcService {
@@ -319,8 +327,8 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("stream failed");
     });
 
-    let grpc_tx = tx.clone();
     let server_grpc_jh = if let Some(addr) = args.grpc_listen {
+        let tx = tx.clone();
         tokio::spawn(async move {
             // Bind service address
             let incoming = TcpIncoming::new(
@@ -331,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|error| anyhow::anyhow!(error))?;
             info!("start listen grpc on {addr}");
 
-            let service = GeyserServer::new(GrpcService { tx: grpc_tx });
+            let service = GeyserServer::new(GrpcService { tx });
 
             let mut builder = Server::builder();
             if let (Some(key_path), Some(cert_path)) = (args.grpc_key, args.grpc_cert) {
@@ -357,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let server_quic_jh = if let Some(addr) = args.quic_listen {
+        let tx = tx.clone();
         tokio::spawn(async move {
             let (certs, key) =
                 if let (Some(key_path), Some(cert_path)) = (args.quic_key, args.quic_cert) {
@@ -427,6 +436,40 @@ async fn main() -> anyhow::Result<()> {
         ready(Ok(Ok(()))).boxed()
     };
 
+    let server_tcp_jh = if let Some(addr) = args.tcp_listen {
+        tokio::spawn(async move {
+            // Bind service address
+            let addr: SocketAddr = addr.parse()?;
+            let incoming = TcpListener::bind(addr).await?;
+            while let Ok((mut stream, _)) = incoming.accept().await {
+                if let Some(nodelay) = args.tcp_nodelay {
+                    stream.set_nodelay(nodelay)?;
+                }
+
+                let mut rx = tx.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(Ok(message)) => {
+                                let message = message.encode_to_vec();
+                                stream.write_u64(message.len() as u64).await?;
+                                stream.write_all(&message).await?;
+                            }
+                            Ok(Err(error)) => anyhow::bail!("subscribe update error: {error:?}"),
+                            Err(_error) => anyhow::bail!("broadcast channel is closed"),
+                        }
+                    }
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+            anyhow::bail!("tcp server failed")
+        })
+        .boxed()
+    } else {
+        ready(Ok(Ok(()))).boxed()
+    };
+
     let _ = tokio::try_join!(
         async move {
             stream_jh.await??;
@@ -438,6 +481,10 @@ async fn main() -> anyhow::Result<()> {
         },
         async move {
             server_quic_jh.await??;
+            Ok::<_, anyhow::Error>(())
+        },
+        async move {
+            server_tcp_jh.await??;
             Ok::<_, anyhow::Error>(())
         },
         async {
